@@ -1,82 +1,56 @@
-# ELK log-generator demo
+# Log generator
 
-A dockerised Python app that emits one JSON log line **every 3 seconds** to
-**Logstash on TCP port 8091**. Logstash stores them in Elasticsearch (daily
-index `app-logs-YYYY.MM.dd`) and also writes raw files to `./logs/`.
+A small Python service that produces one JSON log line every 3 seconds and
+sends it to TCP port **8091** (your Logstash input), while also printing it to
+stdout.
 
-```
-log-generator --TCP 8091--> logstash --> elasticsearch --> kibana (5601)
-                                     \-> ./logs/app-logs-YYYY.MM.dd.log
-```
-
-## Run
+## Run with Docker
 
 ```bash
-git clone <this-repo> && cd <this-repo>
+git clone https://github.com/Arindam-official/simple_test.git
+cd simple_test
 docker compose up -d --build
-docker compose logs -f log-generator
+docker compose logs -f
 ```
 
-First boot takes ~1 minute (Elasticsearch health check gates Logstash/Kibana).
-
-## Verify logs are stored
+By default it targets `host.docker.internal:8091` — i.e. Logstash running on
+the Docker host. Point it somewhere else with a `.env` file or inline vars:
 
 ```bash
-# indices exist
-curl 'http://localhost:9200/_cat/indices/app-logs-*?v'
-
-# latest documents
-curl 'http://localhost:9200/app-logs-*/_search?size=5&sort=@timestamp:desc&pretty'
-
-# raw files on disk
-tail -f logs/app-logs-*.log
+LOGSTASH_HOST=10.0.0.5 docker compose up -d --build
 ```
 
-Kibana: <http://localhost:5601> → **Stack Management → Data Views** → create a
-data view with pattern `app-logs-*` and time field `@timestamp`, then browse in
-**Discover**.
+If your Logstash runs in another compose stack, attach to its network instead
+and set `LOGSTASH_HOST` to that service name.
 
-## Config
+## Run without Docker
 
-Environment variables on the `log-generator` service in `docker-compose.yml`:
+```bash
+LOGSTASH_HOST=localhost python3 generator/app.py
+```
+
+No dependencies — standard library only.
+
+## Settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOGSTASH_HOST` | `logstash` | Target host |
+| `LOGSTASH_HOST` | `host.docker.internal` | Target host |
 | `LOGSTASH_PORT` | `8091` | Target TCP port |
 | `LOG_INTERVAL` | `3` | Seconds between logs |
-| `SERVICE_NAME` | `demo-app` | `service` field value |
+| `SERVICE_NAME` | `demo-app` | Value of the `service` field |
 
-## Send logs from outside Docker
+The service waits (retrying every 3s) until the port accepts connections, and
+reconnects automatically if it goes away.
 
-Port 8091 is published on the host, so anything can feed it:
+## Sample output
 
-```bash
-echo '{"level":"INFO","message":"hello from host","service":"manual"}' | nc localhost 8091
+```json
+{"@timestamp":"2026-07-22T12:26:20.121671+00:00","service":"demo-app","level":"ERROR","message":"upstream timeout","trace_id":"25f1c196-...","http":{"method":"DELETE","path":"/api/orders","status":500,"duration_ms":179.8},"client_ip":"10.0.0.147","user_id":"user-1032"}
 ```
 
-Or run the generator locally:
+Lines are newline-delimited JSON, so the matching Logstash input is:
 
-```bash
-LOGSTASH_HOST=localhost python generator/app.py
 ```
-
-## Already have an ELK stack?
-
-Delete the `elasticsearch`, `logstash`, and `kibana` services from
-`docker-compose.yml`, keep `log-generator`, and point it at your Logstash:
-
-```yaml
-environment:
-  - LOGSTASH_HOST=your-logstash-host
-  - LOGSTASH_PORT=8091
-```
-
-Make sure that Logstash has a `tcp { port => 8091 codec => json_lines }` input.
-
-## Stop
-
-```bash
-docker compose down        # keep data
-docker compose down -v     # wipe Elasticsearch data too
+input { tcp { port => 8091 codec => json_lines } }
 ```
