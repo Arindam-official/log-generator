@@ -1,8 +1,11 @@
 # Log generator
 
-A small Python service that produces one JSON log line every 3 seconds and
-sends it to TCP port **8091** (your Logstash input), while also printing it to
-stdout.
+A small Python service that produces one JSON log line every 3 seconds.
+
+Every line goes to **stdout**, so `docker logs -f log-generator` always shows
+output. On top of that it ships each line, best-effort, to TCP port **8091**
+(your Logstash input). If nothing is listening there the service keeps logging
+anyway and retries the connection every 15s - it never blocks and never exits.
 
 ## Run with Docker
 
@@ -39,9 +42,8 @@ No dependencies — standard library only.
 | `LOGSTASH_PORT` | `8091` | Target TCP port |
 | `LOG_INTERVAL` | `3` | Seconds between logs |
 | `SERVICE_NAME` | `demo-app` | Value of the `service` field |
-
-The service waits (retrying every 3s) until the port accepts connections, and
-reconnects automatically if it goes away.
+| `TCP_OUTPUT` | `true` | Set `false` to log to stdout only |
+| `RETRY_EVERY` | `15` | Seconds between reconnect attempts |
 
 ## Sample output
 
