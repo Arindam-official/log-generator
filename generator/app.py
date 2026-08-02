@@ -1,19 +1,22 @@
-"""Real-world-style JSON log generator.
+"""Real-world-style mixed-format log generator.
 
-Emits structured JSON log lines to stdout every LOG_INTERVAL seconds.
-~80 % of events are successful 2xx responses; ~20 % are 5xx errors.
-Each log line follows an ECS-inspired schema that Logstash / Elasticsearch
-can ingest without any pipeline transforms.
+Emits log lines to stdout every LOG_INTERVAL seconds.
+60 % of events are 5xx errors, 40 % are 2xx successes (configurable).
+5xx errors are a mix of:
+  - Structured JSON  (app-layer errors, ~60 % of 5xx)
+  - Raw non-JSON     (proxy/infra layer: nginx HTML, plain text, XML,
+                      Java stacktrace, PHP fatal, empty body — ~40 % of 5xx)
 
 Environment variables
 ---------------------
-LOGSTASH_HOST   host to ship TCP lines to  (default: host.docker.internal)
-LOGSTASH_PORT   TCP port                   (default: 8091)
-LOG_INTERVAL    seconds between events     (default: 3)
-SERVICE_NAME    value of service.name      (default: demo-app)
-TCP_OUTPUT      set 'false' to stdout only (default: true)
-RETRY_EVERY     seconds between reconnects (default: 15)
-ERROR_RATE      float 0-1, fraction of 5xx (default: 0.20)
+LOGSTASH_HOST   host to ship TCP lines to      (default: host.docker.internal)
+LOGSTASH_PORT   TCP port                       (default: 8091)
+LOG_INTERVAL    seconds between events         (default: 3)
+SERVICE_NAME    value of service.name          (default: demo-app)
+TCP_OUTPUT      set 'false' to stdout only     (default: true)
+RETRY_EVERY     seconds between reconnects     (default: 15)
+ERROR_RATE      fraction of events that are 5xx (default: 0.60)
+NON_JSON_RATE   fraction of 5xx that are raw   (default: 0.40)
 """
 
 import json
@@ -32,7 +35,8 @@ INTERVAL      = float(os.getenv("LOG_INTERVAL", "3"))
 SERVICE       = os.getenv("SERVICE_NAME", "demo-app")
 TCP_OUTPUT    = os.getenv("TCP_OUTPUT", "true").lower() not in ("false", "0", "no")
 RETRY_EVERY   = float(os.getenv("RETRY_EVERY", "15"))
-ERROR_RATE    = float(os.getenv("ERROR_RATE", "0.60"))   # fraction of 5xx events
+ERROR_RATE    = float(os.getenv("ERROR_RATE",    "0.60"))  # fraction of events that are 5xx
+NON_JSON_RATE = float(os.getenv("NON_JSON_RATE", "0.40"))  # fraction of 5xx that emit raw (non-JSON)
 CONNECT_TIMEOUT = 2
 
 # ── Static data pools ─────────────────────────────────────────────────────────
@@ -90,74 +94,168 @@ ERROR_STATUSES = [
     (504, "Gateway Timeout"),
 ]
 
-ERROR_CATALOG = [
+# ── JSON error catalog (app-layer structured errors) ─────────────────────────
+JSON_ERROR_CATALOG = [
+    # --- original 6 ---
     {
         "type":    "DatabaseConnectionError",
         "message": "Connection pool exhausted: max_connections=50 reached",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/db/pool.py", line 83, in acquire\n'
-            "    raise PoolExhaustedError(f'max_connections={MAX_CONN} reached')\n"
-            "DatabaseConnectionError: Connection pool exhausted"
-        ),
+        "stack":   'File "/app/db/pool.py", line 83, in acquire — PoolExhaustedError',
         "logger":  "app.db.pool",
     },
     {
         "type":    "UpstreamTimeoutError",
         "message": "Upstream service did not respond within 5000ms",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/clients/payment_gateway.py", line 47, in charge\n'
-            "    response = await session.post(url, timeout=5.0)\n"
-            "asyncio.exceptions.TimeoutError\n"
-            "UpstreamTimeoutError: Upstream service did not respond within 5000ms"
-        ),
+        "stack":   'File "/app/clients/payment_gateway.py", line 47, in charge — asyncio.TimeoutError',
         "logger":  "app.clients.payment_gateway",
     },
     {
         "type":    "UnhandledExceptionError",
-        "message": "NullPointerException in order processing pipeline",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/services/order_service.py", line 122, in process\n'
-            "    total = sum(item['price'] for item in order['items'])\n"
-            "TypeError: 'NoneType' object is not iterable"
-        ),
+        "message": "TypeError: \'NoneType\' object is not iterable in order processing",
+        "stack":   'File "/app/services/order_service.py", line 122, in process — TypeError',
         "logger":  "app.services.order_service",
     },
     {
         "type":    "CacheBackendError",
         "message": "Redis READONLY - replica in failover state",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/cache/redis_client.py", line 61, in set\n'
-            "    self._client.set(key, value, ex=ttl)\n"
-            "redis.exceptions.ReadOnlyError: READONLY You can't write against a read only replica"
-        ),
+        "stack":   'File "/app/cache/redis_client.py", line 61, in set — redis.ReadOnlyError',
         "logger":  "app.cache.redis_client",
     },
     {
         "type":    "AuthServiceUnavailable",
         "message": "Auth service returned 503 after 3 retries",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/middleware/auth.py", line 38, in verify_token\n'
-            "    resp = await auth_client.introspect(token)\n"
-            "ServiceUnavailableError: Auth service returned 503 after 3 retries"
-        ),
+        "stack":   'File "/app/middleware/auth.py", line 38, in verify_token — ServiceUnavailableError',
         "logger":  "app.middleware.auth",
     },
     {
         "type":    "DiskIOError",
-        "message": "Failed to write audit log: No space left on device",
-        "stack":   (
-            "Traceback (most recent call last):\n"
-            '  File "/app/audit/logger.py", line 19, in write\n'
-            "    fh.write(record)\n"
-            "OSError: [Errno 28] No space left on device"
-        ),
+        "message": "Failed to write audit log: [Errno 28] No space left on device",
+        "stack":   'File "/app/audit/logger.py", line 19, in write — OSError',
         "logger":  "app.audit.logger",
     },
+    # --- new: 10 additional types ---
+    {
+        "type":    "CircuitBreakerOpenError",
+        "message": "Circuit breaker OPEN for inventory-service after 5 consecutive failures",
+        "stack":   'File "/app/resilience/circuit_breaker.py", line 54, in call — CircuitBreakerOpenError',
+        "logger":  "app.resilience.circuit_breaker",
+    },
+    {
+        "type":    "MessageQueueError",
+        "message": "Kafka producer: topic order-events — LEADER_NOT_AVAILABLE",
+        "stack":   'File "/app/events/producer.py", line 31, in publish — KafkaError: LEADER_NOT_AVAILABLE',
+        "logger":  "app.events.producer",
+    },
+    {
+        "type":    "OutOfMemoryError",
+        "message": "Worker killed by OOM killer: RSS 2.1 GB exceeded limit",
+        "stack":   'File "/app/workers/report_worker.py", line 88, in run — MemoryError',
+        "logger":  "app.workers.report_worker",
+    },
+    {
+        "type":    "DeadlockDetected",
+        "message": "PostgreSQL deadlock detected on table orders — transaction rolled back",
+        "stack":   'File "/app/db/session.py", line 67, in commit — psycopg2.errors.DeadlockDetected',
+        "logger":  "app.db.session",
+    },
+    {
+        "type":    "SSLHandshakeError",
+        "message": "SSL handshake failed: certificate has expired (notAfter=Aug 1 00:00:00 2026 GMT)",
+        "stack":   'File "/app/clients/base.py", line 22, in _get_session — ssl.SSLCertVerificationError',
+        "logger":  "app.clients.base",
+    },
+    {
+        "type":    "ConfigurationError",
+        "message": "Required env var PAYMENT_API_SECRET not set — service cannot start handler",
+        "stack":   'File "/app/config.py", line 14, in load — KeyError: PAYMENT_API_SECRET',
+        "logger":  "app.config",
+    },
+    {
+        "type":    "SerializationError",
+        "message": "Protobuf deserialization failed: unexpected field tag 0 in UserEvent",
+        "stack":   'File "/app/serializers/proto.py", line 39, in decode — google.protobuf.message.DecodeError',
+        "logger":  "app.serializers.proto",
+    },
+    {
+        "type":    "ThreadPoolExhausted",
+        "message": "Executor queue full (max_workers=32, queue_size=500) — request rejected",
+        "stack":   'File "/app/server/executor.py", line 78, in submit — RuntimeError: queue full',
+        "logger":  "app.server.executor",
+    },
+    {
+        "type":    "DNSResolutionError",
+        "message": "getaddrinfo failed for payments-svc.internal: Name or service not known",
+        "stack":   'File "/app/clients/payments.py", line 18, in connect — socket.gaierror: [Errno -2]',
+        "logger":  "app.clients.payments",
+    },
+    {
+        "type":    "GRPCStatusError",
+        "message": "gRPC call to user-svc failed: RESOURCE_EXHAUSTED — rate limit exceeded",
+        "stack":   'File "/app/clients/grpc_user.py", line 55, in get_user — grpc.RpcError: RESOURCE_EXHAUSTED',
+        "logger":  "app.clients.grpc_user",
+    },
+]
+
+# ── Non-JSON raw error catalog (proxy / infra layer) ──────────────────────────
+# Each entry is a callable that returns a raw string given (method, path, status).
+NON_JSON_CATALOG = [
+    # nginx HTML 502
+    lambda m, p, s: (
+        '<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n'
+        '<body><center><h1>502 Bad Gateway</h1></center>\r\n'
+        '<hr><center>nginx/1.24.0</center>\r\n</body>\r\n</html>'
+    ),
+    # nginx HTML 503
+    lambda m, p, s: (
+        '<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>\r\n'
+        '<body><center><h1>503 Service Temporarily Unavailable</h1></center>\r\n'
+        '<hr><center>nginx/1.24.0</center>\r\n</body>\r\n</html>'
+    ),
+    # nginx HTML 504
+    lambda m, p, s: (
+        '<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n'
+        '<body><center><h1>504 Gateway Time-out</h1></center>\r\n'
+        '<hr><center>nginx/1.24.0</center>\r\n</body>\r\n</html>'
+    ),
+    # Envoy / Istio plain text upstream error
+    lambda m, p, s: (
+        f'upstream connect error or disconnect/reset before headers. '
+        f'reset reason: connection timeout'
+    ),
+    # HAProxy plain text
+    lambda m, p, s: (
+        f'<html><body><h1>503 Service Unavailable</h1>\n'
+        f'No server is available to handle this request.\n</body></html>'
+    ),
+    # AWS ALB / ELB XML
+    lambda m, p, s: (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ErrorResponse>\n'
+        '  <Error>\n'
+        f'    <Code>ServiceUnavailable</Code>\n'
+        f'    <Message>Service {s} — please retry your request</Message>\n'
+        '  </Error>\n'
+        '</ErrorResponse>'
+    ),
+    # Java / Tomcat unhandled exception plain text
+    lambda m, p, s: (
+        f'java.lang.NullPointerException\n'
+        f'\tat com.example.app.OrderService.process(OrderService.java:142)\n'
+        f'\tat com.example.app.OrderController.createOrder(OrderController.java:88)\n'
+        f'\tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n'
+        f'\tat org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)'
+    ),
+    # PHP-FPM fatal error plain text
+    lambda m, p, s: (
+        f'[{datetime.now(timezone.utc).strftime("%d-%b-%Y %H:%M:%S")} UTC] '
+        f'PHP Fatal error:  Uncaught Error: Call to a member function getId() on null '
+        f'in /var/www/html/src/Controller/PaymentController.php:67\n'
+        f'Stack trace:\n'
+        f'#0 /var/www/html/public/index.php(23): App\\Kernel->handle()\n'
+        f'#1 {{main}}'
+    ),
+    # Empty body (connection reset — zero-byte response)
+    lambda m, p, s: "",
 ]
 
 
@@ -233,13 +331,13 @@ def build_success_event():
     }
 
 
-def build_error_event():
+def build_json_error_event():
+    """Structured JSON error — emitted by the application layer."""
     method, path_tpl, operation = random.choice(ENDPOINTS)
-    path = _resolve_path(path_tpl)
+    path    = _resolve_path(path_tpl)
     status, status_text = random.choice(ERROR_STATUSES)
-    err = random.choice(ERROR_CATALOG)
+    err     = random.choice(JSON_ERROR_CATALOG)
 
-    # 504 timeouts are slow by definition
     if status == 504:
         duration_ms = round(random.uniform(5000, 30000), 2)
     else:
@@ -298,10 +396,22 @@ def build_error_event():
     }
 
 
+def build_raw_error_line():
+    """Raw non-JSON string — emitted by nginx/proxy/infra layer."""
+    method, path_tpl, _ = random.choice(ENDPOINTS)
+    path   = _resolve_path(path_tpl)
+    status, _ = random.choice(ERROR_STATUSES)
+    template   = random.choice(NON_JSON_CATALOG)
+    return template(method, path, status)
+
+
 def build_event():
+    """Return either a dict (JSON) or a raw string (non-JSON)."""
     if random.random() < ERROR_RATE:
-        return build_error_event()
-    return build_success_event()
+        if random.random() < NON_JSON_RATE:
+            return build_raw_error_line()   # raw string
+        return build_json_error_event()     # dict
+    return build_success_event()            # dict
 
 
 # ── TCP Shipper ────────────────────────────────────────────────────────────────
@@ -368,7 +478,11 @@ def main():
 
     while True:
         event = build_event()
-        line  = json.dumps(event)
+        # build_event() returns either a dict (JSON) or a raw string (non-JSON)
+        if isinstance(event, dict):
+            line = json.dumps(event)
+        else:
+            line = event  # already a raw string (HTML / plain text / XML / empty)
         print(line, flush=True)
         if shipper is not None:
             shipper.send((line + "\n").encode("utf-8"))
