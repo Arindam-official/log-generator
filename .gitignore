@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .env
+.claude/
+
+# Captured production log samples — never commit (contain real refs/emails)
+test.txt
+*.log

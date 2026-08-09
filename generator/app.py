@@ -1,11 +1,28 @@
 """Real-world-style mixed-format log generator.
 
 Emits log lines to stdout every LOG_INTERVAL seconds.
-60 % of events are 5xx errors, 40 % are 2xx successes (configurable).
-5xx errors are a mix of:
-  - Structured JSON  (app-layer errors, ~60 % of 5xx)
+60 % of events are errors, 40 % are 2xx successes (configurable).
+Errors are a mix of three shapes:
+  - Spring Boot console lines (app-layer, the `TS LEVEL 1 --- [thread] logger : msg`
+                      format, with flattened HTML / XML / stacktrace bodies)
+  - Structured JSON  (app-layer errors, ECS-ish nested fields)
   - Raw non-JSON     (proxy/infra layer: nginx HTML, plain text, XML,
-                      Java stacktrace, PHP fatal, empty body — ~40 % of 5xx)
+                      Java stacktrace, PHP fatal, empty body)
+
+Sequence numbers
+----------------
+EVERY emitted line carries a monotonically increasing sequence number starting
+at 1, so a downstream collector can be checked for dropped lines:
+
+  JSON lines    -> top-level  "seq": 42
+  all others    -> literal    seq=42   (inside a [seq=42] marker)
+
+Extract them from either shape with:
+
+  docker logs log-generator | grep -oE '"seq": *[0-9]+|seq=[0-9]+' \
+                            | grep -oE '[0-9]+'
+
+The counter restarts at 1 whenever the process restarts.
 
 Environment variables
 ---------------------
@@ -15,8 +32,13 @@ LOG_INTERVAL    seconds between events         (default: 3)
 SERVICE_NAME    value of service.name          (default: demo-app)
 TCP_OUTPUT      set 'false' to stdout only     (default: true)
 RETRY_EVERY     seconds between reconnects     (default: 15)
-ERROR_RATE      fraction of events that are 5xx (default: 0.60)
-NON_JSON_RATE   fraction of 5xx that are raw   (default: 0.40)
+ERROR_RATE      fraction of events that are errors     (default: 0.60)
+SPRING_RATE     fraction of errors as Spring lines     (default: 0.45)
+NON_JSON_RATE   fraction of errors as raw infra output (default: 0.25)
+                (the remainder of errors are structured JSON)
+
+All identifiers below (references, tenant/partner ids, request ids, hosts)
+are randomly generated at runtime. Nothing here is taken from a real system.
 """
 
 import json
@@ -33,10 +55,14 @@ HOST          = os.getenv("LOGSTASH_HOST", "host.docker.internal")
 PORT          = int(os.getenv("LOGSTASH_PORT", "8091"))
 INTERVAL      = float(os.getenv("LOG_INTERVAL", "3"))
 SERVICE       = os.getenv("SERVICE_NAME", "demo-app")
+# Each instance keeps its OWN sequence counter starting at 1, so every line
+# also carries an instance id — otherwise 5 containers all emit seq=1,2,3...
+INSTANCE      = os.getenv("INSTANCE_ID") or socket.gethostname()
 TCP_OUTPUT    = os.getenv("TCP_OUTPUT", "true").lower() not in ("false", "0", "no")
 RETRY_EVERY   = float(os.getenv("RETRY_EVERY", "15"))
-ERROR_RATE    = float(os.getenv("ERROR_RATE",    "0.60"))  # fraction of events that are 5xx
-NON_JSON_RATE = float(os.getenv("NON_JSON_RATE", "0.40"))  # fraction of 5xx that emit raw (non-JSON)
+ERROR_RATE    = float(os.getenv("ERROR_RATE",    "0.60"))  # fraction of events that are errors
+SPRING_RATE   = float(os.getenv("SPRING_RATE",   "0.45"))  # fraction of errors as Spring console lines
+NON_JSON_RATE = float(os.getenv("NON_JSON_RATE", "0.25"))  # fraction of errors as raw infra output
 CONNECT_TIMEOUT = 2
 
 # ── Static data pools ─────────────────────────────────────────────────────────
@@ -196,6 +222,221 @@ JSON_ERROR_CATALOG = [
     },
 ]
 
+# ── Spring Boot console error catalog (app layer) ─────────────────────────────
+# Mimics the classic Spring Boot pattern:
+#   %d{ISO8601} %5p 1 --- [%15.15t] %-40.40logger{39} : %m
+# with the message body carrying a flattened upstream payload (HTML / XML /
+# JSON / stacktrace on a single line, <EOL> where the newlines were).
+
+SPRING_THREADS = [
+    "http-nio-8080-exec-1",
+    "http-nio-8080-exec-4",
+    "http-nio-8080-exec-7",
+    "http-nio-8080-exec-10",
+    "http-nio-8090-exec-2",
+    "http-nio-8090-exec-9",
+    "ntContainer#0-1",
+    "ntContainer#2-1",
+    "ntContainer#5-1",
+    "kafka-consumer-0-C-1",
+    "scheduling-1",
+    "scheduling-3",
+    "task-2",
+    "task-6",
+    "pool-4-thread-1",
+]
+
+EDGE_POPS = ["EDGE01-P1", "EDGE07-P2", "EDGE12-P1", "EDGE23-P3", "EDGE31-P2"]
+
+
+def _rand_token(length, alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"):
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+
+def _rand_request_id():
+    """Base64-ish opaque id, same silhouette as an edge-proxy request id."""
+    alphabet = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz0123456789-_")
+    return _rand_token(54, alphabet) + "=="
+
+
+def _rand_ref():
+    """Synthetic booking-style reference. Shape only — not a real reference."""
+    return (f"{random.randint(100000000, 999999999)}-{_rand_token(6)}-"
+            f"RS{random.randint(10000000, 99999999)}_{random.randint(10000000, 99999999)}")
+
+
+def _today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _flat_html_error(status, title, blurb):
+    """Single-line HTML error body with <EOL> in place of newlines."""
+    return (
+        '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" '
+        '"http://www.w3.org/TR/html4/loose.dtd"><EOL><HTML><HEAD>'
+        '<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1"><EOL>'
+        f'<TITLE>ERROR: {title}</TITLE><EOL></HEAD><BODY><EOL>'
+        f'<H1>{status} ERROR</H1><EOL><H2>{title}</H2><EOL>'
+        '<HR noshade size="1px"><EOL>'
+        f'{blurb}<EOL><BR clear="all"><EOL>'
+        'If this persists, review the edge configuration for this origin before '
+        'retrying the request.<EOL><BR clear="all"><EOL>'
+        '<HR noshade size="1px"><EOL><PRE><EOL>'
+        f'Generated by edge-proxy ({random.choice(EDGE_POPS)})<EOL>'
+        f'Request ID: {_rand_request_id()}<EOL></PRE><EOL>'
+        '<ADDRESS><EOL></ADDRESS><EOL></BODY></HTML>'
+    )
+
+
+def _flat_json_error(code, detail):
+    return (f'{{"error":{{"code":"{code}","detail":"{detail}",'
+            f'"traceId":"{uuid.uuid4().hex}"}}}}')
+
+
+def _flat_soap_fault(code, reason):
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><EOL>'
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><EOL>'
+        '<soap:Body><EOL><soap:Fault><EOL>'
+        f'<faultcode>soap:{code}</faultcode><EOL>'
+        f'<faultstring>{reason}</faultstring><EOL>'
+        '</soap:Fault><EOL></soap:Body><EOL></soap:Envelope>'
+    )
+
+
+def _flat_stacktrace(exception, message, frames):
+    return (f'{exception}: {message}<EOL>'
+            + '<EOL>'.join(f'\tat {f}' for f in frames))
+
+
+# Each entry returns (level, logger_fqcn, message).
+SPRING_ERROR_CATALOG = [
+    lambda: (
+        "ERROR",
+        "com.example.platform.core.svc.notify.WebhookDispatchSvc",
+        f"Exception in sending webhook callback for eventRef: {_rand_ref()} "
+        f"from:  to:  partnerId: partner-{random.randint(100, 999)} with detail: "
+        f'400 Bad Request: "'
+        + _flat_html_error(400, "The request could not be satisfied.",
+                           "Bad request.") + '"',
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.billing.svc.InvoiceSyncMgr",
+        f"Error in Invoice Sync API Call for INV-{random.randint(100000, 999999)}-{_today()} "
+        f"with message 500 Error",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.catalog.svc.PriceFeedMgr",
+        f"Error in Price Feed API Call for SKU-{random.randint(10000, 99999)}-{_today()} "
+        f"with message 503 Error",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.gateway.svc.PaymentCaptureSvc",
+        f"Capture failed for paymentRef: {_rand_token(10)} "
+        f"amount: {random.randint(15, 4200)}.{random.randint(0, 99):02d} EUR with detail: "
+        f'502 Bad Gateway: "'
+        + _flat_html_error(502, "The request could not be satisfied.",
+                           "We can't connect to the origin for this app at this time.") + '"',
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.inventory.job.StockReserveJob",
+        f"Reservation timed out for reservationRef: {_rand_token(8)} after 5000ms — "
+        f"java.net.SocketTimeoutException: Read timed out",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.messaging.KafkaOffsetCommitter",
+        f"Offset commit failed for topic order-events partition {random.randint(0, 11)} "
+        f"groupId: order-processor — "
+        f"org.apache.kafka.clients.consumer.CommitFailedException: rebalance in progress",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.storage.svc.DocumentUploadSvc",
+        f"Upload failed for documentId: doc-{uuid.uuid4().hex[:12]} bucket: internal-docs — "
+        f"S3Exception: Access Denied (Service: S3, Status Code: 403, "
+        f"Request ID: {_rand_token(16)})",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.security.svc.TokenRefreshSvc",
+        f"Token refresh rejected for clientId: svc-{random.randint(1000, 9999)} with detail: "
+        f'401 Unauthorized: "'
+        + _flat_json_error("TOKEN_EXPIRED", "refresh token expired or revoked") + '"',
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.report.worker.PdfRenderWorker",
+        f"Rendering aborted for reportId: rpt-{random.randint(100000, 999999)} after 30000ms — "
+        f"java.util.concurrent.TimeoutException: renderer did not return",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.core.svc.schedule.RetryScheduler",
+        f"Giving up on task {uuid.uuid4().hex[:10]} after 5 attempts — last error: "
+        f"java.net.ConnectException: Connection refused (Connection refused)",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.integration.PartnerSoapClient",
+        f"SOAP fault from partner endpoint for correlationId: {uuid.uuid4()} with detail: "
+        + _flat_soap_fault("Server", "Backend unavailable, try again later"),
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.core.db.LedgerRepository",
+        f"Deadlock while updating ledger row {random.randint(100000, 999999)} — "
+        f"org.postgresql.util.PSQLException: ERROR: deadlock detected; "
+        f"Detail: Process {random.randint(1000, 9999)} waits for ShareLock",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.core.cache.SessionCacheSvc",
+        f"Redis SETEX failed for sessionId: sess-{uuid.uuid4().hex[:12]} — "
+        f"redis.clients.jedis.exceptions.JedisConnectionException: Unexpected end of stream",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.core.svc.mail.MailRelaySvc",
+        f"Relay refused message for messageId: msg-{uuid.uuid4().hex[:12]} — "
+        f"jakarta.mail.SendFailedException: 550 5.7.1 Relay access denied",
+    ),
+    lambda: (
+        "ERROR",
+        "com.example.platform.orders.svc.OrderProcessor",
+        f"Unhandled failure processing orderRef: {_rand_ref()} — "
+        + _flat_stacktrace(
+            "java.lang.NullPointerException",
+            "Cannot invoke \"Segment.getCode()\" because \"segment\" is null",
+            [
+                "com.example.platform.orders.svc.OrderProcessor.process(OrderProcessor.java:214)",
+                "com.example.platform.orders.web.OrderController.create(OrderController.java:96)",
+                "org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)",
+                "java.base/java.lang.Thread.run(Thread.java:1583)",
+            ],
+        ),
+    ),
+    lambda: (
+        " WARN",
+        "com.example.platform.ratelimit.QuotaGuard",
+        f"Downstream quota exceeded for tenantId: tenant-{random.randint(100, 999)} "
+        f"with message 429 Too Many Requests — backing off "
+        f"{random.choice([500, 1000, 2000, 5000])}ms",
+    ),
+    lambda: (
+        " WARN",
+        "com.example.platform.core.svc.health.DependencyProbe",
+        f"Health probe degraded for dependency: pricing-engine "
+        f"latency={random.randint(1500, 9000)}ms threshold=1000ms — marking DOWN",
+    ),
+]
+
+
 # ── Non-JSON raw error catalog (proxy / infra layer) ──────────────────────────
 # Each entry is a callable that returns a raw string given (method, path, status).
 NON_JSON_CATALOG = [
@@ -261,6 +502,40 @@ NON_JSON_CATALOG = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_seq = 0
+
+
+def _next_seq():
+    """Monotonic line counter, 1-based, reset on process start."""
+    global _seq
+    _seq += 1
+    return _seq
+
+
+def _spring_ts():
+    """ISO8601 with millisecond precision, as Spring Boot prints it."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _abbrev_logger(fqcn):
+    """com.example.app.FooSvc -> c.e.a.FooSvc (Logback's logger{39} style)."""
+    parts = fqcn.split(".")
+    return ".".join([p[0] for p in parts[:-1]] + [parts[-1]])
+
+
+def _marker(seq):
+    """Identity marker carried by every non-JSON line."""
+    return f"[inst={INSTANCE} seq={seq}]"
+
+
+def _format_spring(seq, level, logger, thread, message):
+    # %15.15t truncates the thread name from the left, %-40.40logger pads right.
+    return (
+        f"{_spring_ts()} {level:>5} 1 --- [{thread[-15:]:>15}] "
+        f"{_abbrev_logger(logger)[:40]:<40} : {_marker(seq)} {message}"
+    )
+
+
 def _rand_id(prefix="", length=8):
     return prefix + uuid.uuid4().hex[:length]
 
@@ -275,7 +550,7 @@ def _rand_ip():
 
 # ── Event builders ─────────────────────────────────────────────────────────────
 
-def build_success_event():
+def build_success_event(seq):
     method, path_tpl, operation = random.choice(ENDPOINTS)
     path = _resolve_path(path_tpl)
     status, status_text = random.choice(SUCCESS_STATUSES)
@@ -286,6 +561,8 @@ def build_success_event():
 
     return {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
+        "instance": INSTANCE,
+        "seq": seq,
         "log": {
             "level":  "INFO",
             "logger": f"app.routers.{operation}",
@@ -331,7 +608,7 @@ def build_success_event():
     }
 
 
-def build_json_error_event():
+def build_json_error_event(seq):
     """Structured JSON error — emitted by the application layer."""
     method, path_tpl, operation = random.choice(ENDPOINTS)
     path    = _resolve_path(path_tpl)
@@ -347,6 +624,8 @@ def build_json_error_event():
 
     return {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
+        "instance": INSTANCE,
+        "seq": seq,
         "log": {
             "level":  "ERROR",
             "logger": err["logger"],
@@ -396,22 +675,34 @@ def build_json_error_event():
     }
 
 
-def build_raw_error_line():
+def build_raw_error_line(seq):
     """Raw non-JSON string — emitted by nginx/proxy/infra layer."""
     method, path_tpl, _ = random.choice(ENDPOINTS)
     path   = _resolve_path(path_tpl)
     status, _ = random.choice(ERROR_STATUSES)
     template   = random.choice(NON_JSON_CATALOG)
-    return template(method, path, status)
+    body = template(method, path, status)
+    # The seq marker goes first so even a zero-byte body stays identifiable.
+    return f"{_marker(seq)} {body}".rstrip()
 
 
-def build_event():
+def build_spring_error_line(seq):
+    """Spring Boot console line — app layer, single line, may embed HTML/XML."""
+    level, logger, message = random.choice(SPRING_ERROR_CATALOG)()
+    thread = random.choice(SPRING_THREADS)
+    return _format_spring(seq, level, logger, thread, message)
+
+
+def build_event(seq):
     """Return either a dict (JSON) or a raw string (non-JSON)."""
     if random.random() < ERROR_RATE:
-        if random.random() < NON_JSON_RATE:
-            return build_raw_error_line()   # raw string
-        return build_json_error_event()     # dict
-    return build_success_event()            # dict
+        roll = random.random()
+        if roll < SPRING_RATE:
+            return build_spring_error_line(seq)          # raw string
+        if roll < SPRING_RATE + NON_JSON_RATE:
+            return build_raw_error_line(seq)             # raw string
+        return build_json_error_event(seq)               # dict
+    return build_success_event(seq)                      # dict
 
 
 # ── TCP Shipper ────────────────────────────────────────────────────────────────
@@ -470,14 +761,19 @@ def _log(msg):
 
 def main():
     _log(
-        f"service={SERVICE} version={SERVICE_VERSION} "
+        f"instance={INSTANCE} service={SERVICE} version={SERVICE_VERSION} "
         f"interval={INTERVAL}s tcp={TCP_OUTPUT} "
-        f"target={HOST}:{PORT} error_rate={ERROR_RATE:.0%}"
+        f"target={HOST}:{PORT} error_rate={ERROR_RATE:.0%} "
+        f"spring={SPRING_RATE:.0%} raw={NON_JSON_RATE:.0%}"
+    )
+    _log(
+        f"sequence starts at 1 for instance '{INSTANCE}' — JSON lines carry "
+        f'"instance"/"seq", others carry [inst={INSTANCE} seq=N]'
     )
     shipper = Shipper(HOST, PORT) if TCP_OUTPUT else None
 
     while True:
-        event = build_event()
+        event = build_event(_next_seq())
         # build_event() returns either a dict (JSON) or a raw string (non-JSON)
         if isinstance(event, dict):
             line = json.dumps(event)

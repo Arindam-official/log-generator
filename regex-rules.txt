@@ -1,0 +1,15 @@
+is_healthy         = "error"\s*:\s*null
+has_error_level    = (?i)"level"\s*:\s*"(error|fatal|critical|warn)"|\b(ERROR|FATAL|SEVERE|WARN)\s+\d+\s+---
+has_critical_alone = (?i)\b(fatal|panic|traceback|critical)\b|Exception\b
+has_5xx            = (^|[^\w.-])5[0-9]{2}($|[^\w.-])
+has_4xx            = (^|[^\w.-])(400|401|403|405|407|409|413|422|429)($|[^\w.-])
+has_error_context  = (?i)\b(error|fatal|panic|traceback|critical)\b|Exception\b|bad\s+gateway|service\s+(temporarily\s+)?unavailable|serviceunavailable|gateway\s+time-?out|internal\s+server\s+error|temporarily\s+unavailable|too\s+many\s+requests|unauthorized|forbidden|access\s+denied|bad\s+request|payload\s+too\s+large|not\s+found|rate\s+limited
+has_proxy_fault    = (?i)upstream\s+connect\s+error|reset\s+reason|no\s+server\s+is\s+available|<soap:Fault>|faultstring
+
+!is_healthy && (has_error_level || has_critical_alone || ((has_5xx || has_4xx) && has_error_context) || has_proxy_fault)
+
+
+# VRL — inline the match() calls like this. Assigning them to variables first
+# runs every regex on every event and kills the short-circuit (13x slower).
+
+!match(string!(.message), r'"error"\s*:\s*null') && (match(string!(.message), r'(?i)"level"\s*:\s*"(error|fatal|critical|warn)"|\b(ERROR|FATAL|SEVERE|WARN)\s+\d+\s+---') || match(string!(.message), r'(?i)\b(fatal|panic|traceback|critical)\b|Exception\b') || ((match(string!(.message), r'(^|[^\w.-])5[0-9]{2}($|[^\w.-])') || match(string!(.message), r'(^|[^\w.-])(400|401|403|405|407|409|413|422|429)($|[^\w.-])')) && match(string!(.message), r'(?i)\b(error|fatal|panic|traceback|critical)\b|Exception\b|bad\s+gateway|service\s+(temporarily\s+)?unavailable|serviceunavailable|gateway\s+time-?out|internal\s+server\s+error|temporarily\s+unavailable|too\s+many\s+requests|unauthorized|forbidden|access\s+denied|bad\s+request|payload\s+too\s+large|not\s+found|rate\s+limited')) || match(string!(.message), r'(?i)upstream\s+connect\s+error|reset\s+reason|no\s+server\s+is\s+available|<soap:Fault>|faultstring'))
