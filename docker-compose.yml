@@ -1,6 +1,6 @@
 services:
   gen-03s:
-    build: ./generator
+    build: .
     image: log-generator:latest
     container_name: log-generator-03s
     restart: unless-stopped
@@ -19,7 +19,7 @@ services:
       NON_JSON_RATE: "0.25"
 
   gen-08s:
-    build: ./generator
+    build: .
     image: log-generator:latest
     container_name: log-generator-08s
     restart: unless-stopped
@@ -38,7 +38,7 @@ services:
       NON_JSON_RATE: "0.25"
 
   gen-15s:
-    build: ./generator
+    build: .
     image: log-generator:latest
     container_name: log-generator-15s
     restart: unless-stopped
@@ -57,7 +57,7 @@ services:
       NON_JSON_RATE: "0.25"
 
   gen-22s:
-    build: ./generator
+    build: .
     image: log-generator:latest
     container_name: log-generator-22s
     restart: unless-stopped
@@ -76,7 +76,7 @@ services:
       NON_JSON_RATE: "0.25"
 
   gen-30s:
-    build: ./generator
+    build: .
     image: log-generator:latest
     container_name: log-generator-30s
     restart: unless-stopped
