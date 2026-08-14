@@ -1,75 +1,95 @@
-# Five identical generators, differing only in LOG_INTERVAL (3s .. 30s).
-# Each keeps its own sequence counter starting at 1 and stamps every line with
-# its INSTANCE_ID, so gap detection stays unambiguous across all five streams.
-#
-#   docker compose up -d --build     # start all five
-#   docker compose logs -f           # follow all five, interleaved
-#   docker compose logs -f gen-03s   # follow just the 3-second one
-
-x-generator: &generator
-  build: ./generator
-  image: log-generator:latest
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-  restart: unless-stopped
-  stop_grace_period: 5s
-  logging:
-    driver: loki
-    options:
-      loki-url: "${LOKI_URL:-http://10.0.2.56:3100/loki/api/v1/push}"
-      loki-external-labels: "container_name={{.Name}},job=log-generator"
-
-x-generator-env: &generator-env
-  LOGSTASH_HOST: "${LOGSTASH_HOST:-host.docker.internal}"
-  LOGSTASH_PORT: "${LOGSTASH_PORT:-8091}"
-  TCP_OUTPUT: "${TCP_OUTPUT:-true}"
-  RETRY_EVERY: "${RETRY_EVERY:-15}"
-  ERROR_RATE: "${ERROR_RATE:-0.60}"
-  SPRING_RATE: "${SPRING_RATE:-0.45}"
-  NON_JSON_RATE: "${NON_JSON_RATE:-0.25}"
-
 services:
   gen-03s:
-    <<: *generator
+    build: ./generator
+    image: log-generator:latest
     container_name: log-generator-03s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      <<: *generator-env
       INSTANCE_ID: "g03"
-      SERVICE_NAME: "${SERVICE_NAME:-demo-app}-03s"
+      SERVICE_NAME: "demo-app-03s"
       LOG_INTERVAL: "3"
+      LOGSTASH_HOST: "host.docker.internal"
+      LOGSTASH_PORT: "8091"
+      TCP_OUTPUT: "true"
+      RETRY_EVERY: "15"
+      ERROR_RATE: "0.60"
+      SPRING_RATE: "0.45"
+      NON_JSON_RATE: "0.25"
 
   gen-08s:
-    <<: *generator
+    build: ./generator
+    image: log-generator:latest
     container_name: log-generator-08s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      <<: *generator-env
       INSTANCE_ID: "g08"
-      SERVICE_NAME: "${SERVICE_NAME:-demo-app}-08s"
+      SERVICE_NAME: "demo-app-08s"
       LOG_INTERVAL: "8"
+      LOGSTASH_HOST: "host.docker.internal"
+      LOGSTASH_PORT: "8091"
+      TCP_OUTPUT: "true"
+      RETRY_EVERY: "15"
+      ERROR_RATE: "0.60"
+      SPRING_RATE: "0.45"
+      NON_JSON_RATE: "0.25"
 
   gen-15s:
-    <<: *generator
+    build: ./generator
+    image: log-generator:latest
     container_name: log-generator-15s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      <<: *generator-env
       INSTANCE_ID: "g15"
-      SERVICE_NAME: "${SERVICE_NAME:-demo-app}-15s"
+      SERVICE_NAME: "demo-app-15s"
       LOG_INTERVAL: "15"
+      LOGSTASH_HOST: "host.docker.internal"
+      LOGSTASH_PORT: "8091"
+      TCP_OUTPUT: "true"
+      RETRY_EVERY: "15"
+      ERROR_RATE: "0.60"
+      SPRING_RATE: "0.45"
+      NON_JSON_RATE: "0.25"
 
   gen-22s:
-    <<: *generator
+    build: ./generator
+    image: log-generator:latest
     container_name: log-generator-22s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      <<: *generator-env
       INSTANCE_ID: "g22"
-      SERVICE_NAME: "${SERVICE_NAME:-demo-app}-22s"
+      SERVICE_NAME: "demo-app-22s"
       LOG_INTERVAL: "22"
+      LOGSTASH_HOST: "host.docker.internal"
+      LOGSTASH_PORT: "8091"
+      TCP_OUTPUT: "true"
+      RETRY_EVERY: "15"
+      ERROR_RATE: "0.60"
+      SPRING_RATE: "0.45"
+      NON_JSON_RATE: "0.25"
 
   gen-30s:
-    <<: *generator
+    build: ./generator
+    image: log-generator:latest
     container_name: log-generator-30s
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      <<: *generator-env
       INSTANCE_ID: "g30"
-      SERVICE_NAME: "${SERVICE_NAME:-demo-app}-30s"
+      SERVICE_NAME: "demo-app-30s"
       LOG_INTERVAL: "30"
+      LOGSTASH_HOST: "host.docker.internal"
+      LOGSTASH_PORT: "8091"
+      TCP_OUTPUT: "true"
+      RETRY_EVERY: "15"
+      ERROR_RATE: "0.60"
+      SPRING_RATE: "0.45"
+      NON_JSON_RATE: "0.25"
